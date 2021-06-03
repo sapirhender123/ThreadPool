@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdbool.h>
 
 #include "osqueue.h"
 #include "threadPool.h"
@@ -11,48 +12,65 @@
         printf(msg": %s\n", strerror(errnum));  \
         goto error;                             \
     }                                           \
-while (0);
+} while (0);
 
 #define CHECK_PERROR(cond, msg) do {    \
-    if (!cond) {                        \
+    if (!(cond)) {                      \
         perror(msg);                    \
         goto error;                     \
     }                                   \
-while (0);
+} while (0);
 
 static void *threadLoop(void *arg) {
-    ThreadPool *tp = (ThreadPool *)arg;
+    thread_arg *ta = (thread_arg *)arg;
+    ThreadPool *tp = ta->tp;
 
-    // while the thread pool not destroyed
-    while (THREAD_POOL_DESTROYED != tp->state.tps) {
+    while (true) {
         CHECK_PRINT(pthread_mutex_lock(&tp->state.lock), "Lock failed");
-        CHECK_PRINT(pthread_cond_wait(&tp->state.availableTaskCond, &tp->state.lock), "Wait failed");
 
         // wait for a task from the queue
-        if (THREAD_POOL_DESTROYED == tp->state.tps) { // if now the thread pool destroyed
-            goto unlock;
+        while (osIsQueueEmpty(tp->taskQueue) && THREAD_POOL_DESTROYED != tp->state.tps) {
+            CHECK_PRINT(pthread_cond_wait(&tp->state.availableTaskCond, &tp->state.lock), "Wait failed");
+        }
+
+        if (THREAD_POOL_DESTROYED == tp->state.tps) {
+            break;
         }
 
         // Take a task from the queue -> Dequeue
         task *t = osDequeue(tp->taskQueue);
-        if (NULL == t) {
-            goto unlock;
-        }
-
+        tp->state.currentTaskCount++;
         CHECK_PRINT(pthread_mutex_unlock(&tp->state.lock), "Unlock failed"); // unlock the mutex
 
-        // No need to hold the lock when executing a task
-        t->func(t->param);
-        free(t);
+        if (NULL != t) {
+            // No need to hold the lock when executing a task
+            t->func(t->param);
+            free(t);
+        }
 
-        error:;
+        CHECK_PRINT(pthread_mutex_lock(&tp->state.lock), "Lock failed");
+        tp->state.currentTaskCount--;
+        if (THREAD_POOL_DESTROYED != tp->state.tps // ThreadPool still alive
+            && 0 == tp->state.currentTaskCount // All workers finished executing tasks
+            && osIsQueueEmpty(tp->taskQueue)) // No more work in the pool
+        {
+            // Signal the thread pool that the work is done
+            CHECK_PRINT(pthread_cond_signal(&tp->state.workDoneCond), "Signal failed");
+        }
+        CHECK_PRINT(pthread_mutex_unlock(&tp->state.lock), "Unlock failed");
     }
 
-unlock:
-    if (0 != pthread_mutex_unlock(&tp->state.lock)) {
-      printf("Unlock failed");
-    }
-    return NULL;
+error:
+    tp->state.currentThreadCount--;
+    CHECK_PRINT(pthread_cond_signal(&tp->state.workDoneCond), "Signal failed");
+    CHECK_PRINT(pthread_mutex_unlock(&tp->state.lock), "Unlock failed");
+
+#ifdef DEBUG
+    printf("[%d] Exited\n", ta->id);
+#endif
+
+    free(ta);
+    pthread_exit(NULL);
 }
 
 ThreadPool* tpCreate(int numOfThreads) {
@@ -62,6 +80,8 @@ ThreadPool* tpCreate(int numOfThreads) {
 
     // Initialize the max count of threads
     tp->maxTaskCount = numOfThreads;
+    tp->state.currentThreadCount = numOfThreads;
+
     // Initialize the state of the thread pool
     tp->state.tps = THREAD_POOL_ACTIVE;
 
@@ -69,18 +89,26 @@ ThreadPool* tpCreate(int numOfThreads) {
     tp->threads = NULL;
 
     // Initialize lock
-    CHECK_PRINT(0 != pthread_mutex_init(&tp->state.lock, "Init failed"));
-    CHECK_PRINT(0 != pthread_mutex_init(&tp->action_lock, "Init failed"));
+    CHECK_PRINT(0 != pthread_mutex_init(&tp->state.lock, NULL), "Mutex init failed");
+
+    // Initialize conditions
+    CHECK_PRINT(0 != pthread_cond_init(&tp->state.availableTaskCond, NULL), "Cond init failed");
+    CHECK_PRINT(0 != pthread_cond_init(&tp->state.workDoneCond, NULL), "Cond init failed");
 
     tp->taskQueue = osCreateQueue(); // build a queue for the thread pool
     tp->threads = malloc(numOfThreads * sizeof(pthread_t *)); // threads list
-    CHECK_PERROR(NULL != tp->threads, "Malloc Failed"));
+    CHECK_PERROR(NULL != tp->threads, "Malloc Failed");
 
     // create number of threads as we requested
-    for (; i < numOfThreads; i++) {
+    for (i = 0; i < numOfThreads; i++) {
         tp->threads[i] = malloc(sizeof(pthread_t *));
-        CHECK_PERROR(NULL != tp->threads[i], "Malloc Failed"));
-        CHECK_PRINT(pthread_create(tp->threads[i], NULL, threadLoop, tp), "Create thread Failed"));
+        CHECK_PERROR(NULL != tp->threads[i], "Malloc Failed");
+
+        thread_arg *ta = malloc(sizeof(thread_arg));
+        CHECK_PERROR(NULL != ta, "Malloc Failed");
+        ta->tp = tp;
+        ta->id = i;
+        CHECK_PRINT(pthread_create(tp->threads[i], NULL, threadLoop, ta), "Create thread Failed");
     }
 
     return tp;
@@ -96,75 +124,102 @@ error: // In case of error, free the memory that allocated
     return NULL;
 }
 
-
-
 void tpDestroy(ThreadPool* threadPool, int shouldWaitForTasks) {
     // If trying to destroy thread pool that already destroyed
-    if (THREAD_POOL_DESTROYED == threadPool->state.tps) {
+    if (threadPool == NULL || THREAD_POOL_DESTROYED == threadPool->state.tps) {
         return;
     }
 
-    // Acquire mutex
-    CHECK_PRINT(pthread_mutex_lock(&threadPool->action_lock), "Lock failed");
-
-    // if shouldWaitForTasks is a non-zero and positive number, wait until queueTask is empty
-    if (shouldWaitForTasks > 0) { // wait until all of the tasks will finish
+    CHECK_PRINT(pthread_mutex_lock(&threadPool->state.lock), "Lock failed");
+    if (0 == shouldWaitForTasks) {
+        // Don't wait for all work to be done - destroy work in queue
         while (!osIsQueueEmpty(threadPool->taskQueue)) {
-            pthread_cond_signal(&threadPool->state.availableTaskCond);
+            free(osDequeue(threadPool->taskQueue));
+        }
+    } else {
+        // Wait for all workers to empty the task queue and finish all available work
+        while (true) {
+            if (!osIsQueueEmpty(threadPool->taskQueue)) { // if there is still work in the queue
+                // Wait for a worker to signal that the work is done
+                CHECK_PRINT(pthread_cond_wait(&threadPool->state.workDoneCond, &threadPool->state.lock), "Cond wait failed");
+            } else {
+                break;
+            }
         }
     }
 
+    // Set state of thread pool to destroyed
     threadPool->state.tps = THREAD_POOL_DESTROYED;
-    pthread_cond_broadcast(&threadPool->state.availableTaskCond);
 
-    // wait to all threads to be finished
-    for (int i = 0; i < threadPool->maxTaskCount; i++) {
-        CHECK_PRINT(pthread_join(*threadPool->threads[i], NULL), "Join Failed");
+    // Notify any worker that is waiting on availableTaskCond that the thread pool is destroyed
+    CHECK_PRINT(pthread_cond_broadcast(&threadPool->state.availableTaskCond), "Broadcast failed");
+
+    // Wait for threads to finish working
+    // When a worker detects that no workers are executing tasks and the task pool is empty, it notifies
+    // the pool manager via the workDoneCond condition.
+    while (true) {
+        if (threadPool->state.currentThreadCount != 0) { // if there is any thread executing a task
+            CHECK_PRINT(pthread_cond_wait(&threadPool->state.workDoneCond, &threadPool->state.lock), "Cond wait failed");
+        } else {
+            break;
+        }
+    }
+
+    // Now we know that all threads have exited
+    CHECK_PRINT(pthread_mutex_unlock(&threadPool->state.lock), "Unlock failed");
+
+    // Now we can release allocated memory
+    int k;
+    for (k = 0; k < threadPool->maxTaskCount; k++) {
+        CHECK_PRINT(pthread_join(*threadPool->threads[k], NULL), "Join Failed");
+        free(threadPool->threads[k]);
     }
 
     if (NULL != threadPool->threads) {
         free(threadPool->threads);
-        threadPool->threads = NULL;
     }
 
-    while (!osIsQueueEmpty(threadPool->taskQueue)) {
-        task *t = osDequeue(threadPool->taskQueue);
-        free(t);
-    }
-
-    if (NULL != threadPool->taskQueue) {
-        free(threadPool->taskQueue);
-        threadPool->taskQueue = NULL;
-    }
-
-    CHECK_PRINT(pthread_mutex_unlock(&threadPool->action_lock), "Unlock Failed");
+    osDestroyQueue(threadPool->taskQueue);
+    free(threadPool);
+    return;
 
     error:;
+    exit(-1);
 }
 
 int tpInsertTask(ThreadPool* threadPool, void (*computeFunc) (void *), void* param) {
     if (THREAD_POOL_DESTROYED == threadPool->state.tps) {
-        // Error
+        // Cannot insert a task to a destroyed thread pool
         return -1;
     }
-    // in order to prevent errors
-    CHECK_PRINT(pthread_mutex_lock(&threadPool->action_lock), "Lock Failed");
+
     if (NULL == threadPool->taskQueue) {
         return -1;
     }
 
+    task *t = NULL;
+    CHECK_PRINT(pthread_mutex_lock(&threadPool->state.lock), "Lock Failed");
+
     // Enqueue task into taskQueue
-    task *t = malloc(sizeof(task));
-    CHECK_PERROR((NULL != t),"Malloc Failed");
+    t = malloc(sizeof(task));
+    if (NULL == t) {
+        perror("Malloc Failed");
+        CHECK_PRINT(pthread_mutex_unlock(&threadPool->state.lock), "Unlock Failed");
+        goto error;
+    }
 
     t->func = computeFunc;
     t->param = param;
     osEnqueue(threadPool->taskQueue, t); // Insert to the queue
+    CHECK_PRINT(pthread_mutex_unlock(&threadPool->state.lock), "Unlock Failed");
 
-    // Notify threads to take a task
-    CHECK_PRINT(pthread_cond_signal(&threadPool->state.availableTaskCond), "Signal Failed");
-    CHECK_PRINT(pthread_mutex_unlock(&threadPool->action_lock), "Unlock Failed");
+    // Notify workers to take a task
+    CHECK_PRINT(pthread_cond_broadcast(&threadPool->state.availableTaskCond), "Signal Failed");
     return 0;
 
-    error:;
+    error:
+    if (t != NULL) {
+        free(t);
+    }
+    return -1;
 }

@@ -18,14 +18,28 @@ typedef struct thread_pool
         // Increase - When adding a task
         // Decrease - When deleting a task
         size_t currentTaskCount;
+        size_t currentThreadCount;
 
-        pthread_mutex_t *lock;
-        pthread_cond_t *availableTaskCond;
+        pthread_mutex_t lock;
+        pthread_cond_t availableTaskCond;
+        pthread_cond_t workDoneCond;
 
         // State - one of ThreadPoolState
         ThreadPoolState tps;
     } state;
 } ThreadPool;
+
+typedef struct {
+    ThreadPool  *tp;
+    int id;
+} thread_arg;
+
+typedef void (*compute_func_t) (void *);
+
+typedef struct {
+    compute_func_t func;
+    void *param;
+} task;
 
 ThreadPool* tpCreate(int numOfThreads);
 
